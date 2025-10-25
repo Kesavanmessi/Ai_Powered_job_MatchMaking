@@ -74,3 +74,4 @@ applicationSchema.index({ matchScore: -1 });
 module.exports = mongoose.model('Application', applicationSchema);
 
 
+

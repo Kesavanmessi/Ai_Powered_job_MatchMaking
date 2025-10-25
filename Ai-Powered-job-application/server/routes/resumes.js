@@ -61,9 +61,6 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
 
     // Parse the uploaded resume
     const parseResult = await resumeParser.parseResume(req.file.path, req.file.mimetype);
-    
-    // Perform AI analysis
-    const aiAnalysis = await resumeParser.analyzeResumeWithAI(parseResult.extractedData);
 
     // Create new resume record
     const resume = new Resume({
@@ -78,7 +75,7 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
       embedding: parseResult.embedding,
       skillsEmbedding: parseResult.skillsEmbedding,
       aiAnalysis: {
-        ...aiAnalysis,
+        ...parseResult.aiAnalysis,
         lastAnalyzed: new Date()
       }
     });
