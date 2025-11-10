@@ -1,10 +1,45 @@
 const express = require('express');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { auth } = require('../middleware/auth');
+require('dotenv').config();
 
 const router = express.Router();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Get model from environment or use default (gemini-pro is more widely available)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-pro';
+
+// Helper function to clean and parse JSON from AI responses
+function parseAIJsonResponse(text) {
+  try {
+    // Remove markdown code fences (```json and ```)
+    let cleaned = text.replace(/```json|```/g, '').trim();
+    
+    // Find JSON object boundaries
+    const jsonStart = cleaned.indexOf('{');
+    const jsonEnd = cleaned.lastIndexOf('}');
+    
+    if (jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart) {
+      // If no JSON object found, try to find JSON array
+      const arrayStart = cleaned.indexOf('[');
+      const arrayEnd = cleaned.lastIndexOf(']');
+      
+      if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+        cleaned = cleaned.substring(arrayStart, arrayEnd + 1);
+      } else {
+        throw new Error('No valid JSON found in AI response');
+      }
+    } else {
+      cleaned = cleaned.substring(jsonStart, jsonEnd + 1);
+    }
+    
+    return JSON.parse(cleaned);
+  } catch (error) {
+    console.error('JSON parsing error:', error);
+    console.error('Raw response text:', text);
+    throw error;
+  }
+}
 
 // @route   POST /api/interviews/generate-questions
 // @desc    Generate personalized interview questions
@@ -147,10 +182,10 @@ async function generateInterviewQuestions(jobData, resumeData, questionTypes, co
       - Include follow-up questions for deeper discussion
     `;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    const questionsData = JSON.parse(response.text());
+    const questionsData = parseAIJsonResponse(response.text());
     return questionsData.questions || [];
   } catch (error) {
     console.error('AI question generation error:', error);
@@ -188,10 +223,20 @@ async function analyzeInterviewAnswer(question, answer, jobContext) {
       - Confidence level
     `;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    const analysis = JSON.parse(response.text());
+    const analysis = parseAIJsonResponse(response.text());
+    
+    // Ensure all required fields exist with defaults
+    if (typeof analysis.score !== 'number') analysis.score = 70;
+    if (!Array.isArray(analysis.strengths)) analysis.strengths = [];
+    if (!Array.isArray(analysis.weaknesses)) analysis.weaknesses = [];
+    if (!Array.isArray(analysis.suggestions)) analysis.suggestions = [];
+    if (!Array.isArray(analysis.keywords)) analysis.keywords = [];
+    if (!analysis.overallFeedback) analysis.overallFeedback = 'Good answer';
+    if (!Array.isArray(analysis.improvementAreas)) analysis.improvementAreas = [];
+    
     return analysis;
   } catch (error) {
     console.error('AI answer analysis error:', error);
@@ -237,11 +282,22 @@ async function generatePrepTips(jobTitle, company, industry) {
       - Follow-up Actions
     `;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    const tipsData = JSON.parse(response.text());
-    return tipsData.tips || [];
+    const tipsData = parseAIJsonResponse(response.text());
+    
+    // Ensure tips array exists
+    if (!tipsData.tips || !Array.isArray(tipsData.tips)) {
+      // If response is directly an array, use it
+      if (Array.isArray(tipsData)) {
+        return tipsData;
+      }
+      // Otherwise return empty array
+      return [];
+    }
+    
+    return tipsData.tips;
   } catch (error) {
     console.error('AI tips generation error:', error);
     return generateFallbackTips();

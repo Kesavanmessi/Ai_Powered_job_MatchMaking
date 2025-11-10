@@ -1,10 +1,47 @@
-// AIMatchingService.js (No changes)
+// AIMatchingService.js
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const Match = require('../models/Match');
 const Job = require('../models/Job');
 const Resume = require('../models/Resume');
+require('dotenv').config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Get model from environment or use default (gemini-pro is more widely available)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-pro';
+// Embedding model - use text-embedding-004 for better quality
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-004';
+
+// Helper function to clean and parse JSON from AI responses
+function parseAIJsonResponse(text) {
+  try {
+    // Remove markdown code fences (```json and ```)
+    let cleaned = text.replace(/```json|```/g, '').trim();
+    
+    // Find JSON object boundaries
+    const jsonStart = cleaned.indexOf('{');
+    const jsonEnd = cleaned.lastIndexOf('}');
+    
+    if (jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart) {
+      // If no JSON object found, try to find JSON array
+      const arrayStart = cleaned.indexOf('[');
+      const arrayEnd = cleaned.lastIndexOf(']');
+      
+      if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+        cleaned = cleaned.substring(arrayStart, arrayEnd + 1);
+      } else {
+        throw new Error('No valid JSON found in AI response');
+      }
+    } else {
+      cleaned = cleaned.substring(jsonStart, jsonEnd + 1);
+    }
+    
+    return JSON.parse(cleaned);
+  } catch (error) {
+    console.error('JSON parsing error:', error);
+    console.error('Raw response text:', text.substring(0, 500)); // Log first 500 chars to avoid huge logs
+    throw error;
+  }
+}
 
 class AIMatchingService {
   constructor() {
@@ -40,7 +77,7 @@ class AIMatchingService {
   // Generate embedding for text using Gemini
   async generateEmbedding(text) {
     try {
-      const model = genAI.getGenerativeModel({ model: 'embedding-001' });
+      const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
       const result = await model.embedContent(text.substring(0, 8000));
       return result.embedding.values;
     } catch (error) {
@@ -200,7 +237,7 @@ class AIMatchingService {
         Return only a number between 0-100.
       `;
 
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
       const result = await model.generateContent(prompt);
       const response = await result.response;
       const score = parseInt(response.text().trim());
@@ -415,28 +452,49 @@ class AIMatchingService {
         }
       `;
 
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const insightsText = response.text();
-      return JSON.parse(insightsText);
-    } catch (error) {
-      console.error('AI insights generation error:', error);
-      
-      // Check if it's a quota limit error
-      if (error.message && (error.message.includes('quota') || error.message.includes('429'))) {
-        console.warn('API quota exceeded for insights generation, using fallback method');
-        return this.generateFallbackInsights(resume, job, matchScore);
-      }
-      
-      return {
-        strengths: [],
-        weaknesses: [],
-        recommendations: [],
-        interviewTips: [],
-        skillGaps: []
-      };
-    }
+      const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const insightsText = response.text();
+      const insights = parseAIJsonResponse(insightsText);
+      
+      // Ensure all required fields exist with defaults
+      if (!insights.strengths || !Array.isArray(insights.strengths)) {
+        insights.strengths = [];
+      }
+      if (!insights.weaknesses || !Array.isArray(insights.weaknesses)) {
+        insights.weaknesses = [];
+      }
+      if (!insights.recommendations || !Array.isArray(insights.recommendations)) {
+        insights.recommendations = [];
+      }
+      if (!insights.interviewTips || !Array.isArray(insights.interviewTips)) {
+        insights.interviewTips = [];
+      }
+      if (!insights.skillGaps || !Array.isArray(insights.skillGaps)) {
+        insights.skillGaps = [];
+      }
+      
+      return insights;
+    } catch (error) {
+      console.error('AI insights generation error:', error);
+      
+      // Check if it's a JSON parsing error
+      if (error instanceof SyntaxError || error.message.includes('JSON') || error.message.includes('Unexpected token')) {
+        console.warn('JSON parsing failed for AI insights, using fallback method');
+        return this.generateFallbackInsights(resume, job, matchScore);
+      }
+      
+      // Check if it's a quota limit error
+      if (error.message && (error.message.includes('quota') || error.message.includes('429'))) {
+        console.warn('API quota exceeded for insights generation, using fallback method');
+        return this.generateFallbackInsights(resume, job, matchScore);
+      }
+      
+      // For any other error, use fallback insights instead of empty object
+      console.warn('AI insights generation failed, using fallback method');
+      return this.generateFallbackInsights(resume, job, matchScore);
+    }
   }
 
   // Fallback insights generation without AI

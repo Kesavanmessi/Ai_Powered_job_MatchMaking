@@ -16,7 +16,7 @@ const resumeSchema = new mongoose.Schema({
   },
   filePath: {
     type: String,
-    required: true
+    required: false // Optional when using Cloudinary
   },
   fileSize: Number,
   mimeType: String,

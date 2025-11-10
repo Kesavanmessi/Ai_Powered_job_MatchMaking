@@ -2,26 +2,27 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
 const Resume = require('../models/Resume');
 const resumeParser = require('../services/resumeParser');
 const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/resumes';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `resume-${req.user._id}-${uniqueSuffix}${path.extname(file.originalname)}`);
-  }
-});
+// Configure Cloudinary (only if credentials are provided)
+if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+  });
+  console.log('Cloudinary configured successfully');
+} else {
+  console.warn('Cloudinary credentials not found. Resumes will be stored locally.');
+}
+
+// Use memory storage to handle file in buffer, then upload to Cloudinary manually
+const memoryStorage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   const allowedTypes = process.env.ALLOWED_FILE_TYPES?.split(',') || [
@@ -37,7 +38,7 @@ const fileFilter = (req, file, cb) => {
 };
 
 const upload = multer({
-  storage,
+  storage: memoryStorage,
   fileFilter,
   limits: {
     fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024 // 10MB default
@@ -48,6 +49,11 @@ const upload = multer({
 // @desc    Upload and parse resume
 // @access  Private
 router.post('/upload', auth, upload.single('resume'), async (req, res) => {
+  // Declare variables outside try block for cleanup in catch
+  let cloudinaryUrl = null;
+  let cloudinaryPublicId = null;
+  let localFilePath = null;
+
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'No file uploaded' });
@@ -59,17 +65,63 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
       await existingResume.archive();
     }
 
-    // Parse the uploaded resume
-    const parseResult = await resumeParser.parseResume(req.file.path, req.file.mimetype);
+    // Get file buffer (from memory storage)
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+    const fileSize = req.file.size;
+    const mimeType = req.file.mimetype;
+
+    if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+      try {
+        // Upload buffer to Cloudinary
+        const uploadResult = await new Promise((resolve, reject) => {
+          const uploadStream = cloudinary.uploader.upload_stream(
+            {
+              resource_type: 'raw',
+              folder: 'resumes',
+              public_id: `resume-${req.user._id}-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+              format: mimeType === 'application/pdf' ? 'pdf' : 'docx'
+            },
+            (error, result) => {
+              if (error) reject(error);
+              else resolve(result);
+            }
+          );
+          uploadStream.end(fileBuffer);
+        });
+
+        cloudinaryUrl = uploadResult.secure_url;
+        cloudinaryPublicId = uploadResult.public_id;
+      } catch (cloudinaryError) {
+        console.error('Cloudinary upload error:', cloudinaryError);
+        // Continue without Cloudinary - file will be processed from buffer
+        // In production, you might want to fail here or use fallback storage
+      }
+    } else {
+      // Fallback: Save to local storage if Cloudinary is not configured
+      const uploadsDir = path.join(__dirname, '../uploads/resumes');
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      
+      const uniqueFileName = `resume-${req.user._id}-${Date.now()}-${Math.random().toString(36).substring(7)}.${mimeType === 'application/pdf' ? 'pdf' : 'docx'}`;
+      localFilePath = path.join(uploadsDir, uniqueFileName);
+      fs.writeFileSync(localFilePath, fileBuffer);
+    }
+
+    // Parse the uploaded resume from buffer
+    const parseResult = await resumeParser.parseResume(fileBuffer, mimeType);
 
     // Create new resume record
     const resume = new Resume({
       user: req.user._id,
-      fileName: req.file.filename,
-      originalName: req.file.originalname,
-      filePath: req.file.path,
-      fileSize: req.file.size,
-      mimeType: req.file.mimetype,
+      fileName: cloudinaryPublicId || fileName || `resume-${Date.now()}`,
+      originalName: fileName,
+      filePath: localFilePath || cloudinaryUrl || '', // Optional: can be Cloudinary URL or local path
+      cloudinaryUrl: cloudinaryUrl,
+      cloudinaryPublicId: cloudinaryPublicId,
+      fileSize: fileSize,
+      mimeType: mimeType,
       parsedText: parseResult.parsedText,
       extractedData: parseResult.extractedData,
       embedding: parseResult.embedding,
@@ -88,6 +140,8 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
         id: resume._id,
         fileName: resume.fileName,
         originalName: resume.originalName,
+        cloudinaryUrl: resume.cloudinaryUrl,
+        fileSize: resume.fileSize,
         extractedData: resume.extractedData,
         aiAnalysis: resume.aiAnalysis,
         createdAt: resume.createdAt
@@ -96,9 +150,22 @@ router.post('/upload', auth, upload.single('resume'), async (req, res) => {
   } catch (error) {
     console.error('Resume upload error:', error);
     
-    // Clean up uploaded file if parsing failed
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
+    // Clean up locally saved file if it was created
+    if (localFilePath && fs.existsSync(localFilePath)) {
+      try {
+        fs.unlinkSync(localFilePath);
+      } catch (unlinkError) {
+        console.error('Error cleaning up local file:', unlinkError);
+      }
+    }
+
+    // Clean up Cloudinary file if it was uploaded but parsing failed
+    if (cloudinaryPublicId && process.env.CLOUDINARY_CLOUD_NAME) {
+      try {
+        await cloudinary.uploader.destroy(cloudinaryPublicId, { resource_type: 'raw' });
+      } catch (cloudinaryError) {
+        console.error('Error cleaning up Cloudinary file:', cloudinaryError);
+      }
     }
 
     res.status(500).json({
@@ -146,8 +213,13 @@ router.get('/active', auth, async (req, res) => {
   try {
     const resume = await Resume.getLatestForUser(req.user._id);
     
+    // Return 200 with null resume if no active resume exists (not 404)
+    // This is more RESTful - 404 should be for route not found, not missing resource
     if (!resume) {
-      return res.status(404).json({ message: 'No active resume found' });
+      return res.status(200).json({ 
+        resume: null,
+        message: 'No active resume found' 
+      });
     }
 
     res.json({
@@ -155,6 +227,8 @@ router.get('/active', auth, async (req, res) => {
         id: resume._id,
         fileName: resume.fileName,
         originalName: resume.originalName,
+        cloudinaryUrl: resume.cloudinaryUrl,
+        fileSize: resume.fileSize,
         extractedData: resume.extractedData,
         aiAnalysis: resume.aiAnalysis,
         version: resume.version,

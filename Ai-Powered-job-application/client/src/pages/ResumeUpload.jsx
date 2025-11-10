@@ -30,12 +30,22 @@ const ResumeUpload = () => {
   const fetchResumes = async () => {
     try {
       const response = await axios.get('/api/resumes/my-resumes');
-      setResumes(response.data.resumes);
+      setResumes(response.data.resumes || []);
       
-      const activeResumeResponse = await axios.get('/api/resumes/active');
-      setActiveResume(activeResumeResponse.data.resume);
+      // Fetch active resume - handle case where no active resume exists
+      try {
+        const activeResumeResponse = await axios.get('/api/resumes/active');
+        setActiveResume(activeResumeResponse.data.resume || null);
+      } catch (activeError) {
+        // If 404 or other error, set active resume to null
+        console.warn('No active resume found or error fetching active resume:', activeError.response?.status);
+        setActiveResume(null);
+      }
     } catch (error) {
       console.error('Failed to fetch resumes:', error);
+      // Set empty arrays/null on error
+      setResumes([]);
+      setActiveResume(null);
     } finally {
       setLoading(false);
     }

@@ -1,5 +1,7 @@
 // resumeParser.js
 const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -7,66 +9,150 @@ require('dotenv').config();
 
 // Initialize the Gemini AI client
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Get model from environment or use default (gemini-pro is more widely available)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// Embedding model - use text-embedding-004 for better quality
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-004';
 
 class ResumeParser {
-  constructor() {
-    this.supportedFormats = {
-      'application/pdf': this.parsePDF.bind(this),
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': this.parseDOCX.bind(this)
-    };
-  }
+  constructor() {
+    this.supportedFormats = {
+      'application/pdf': (filePathOrBuffer, mimeType) => this.parsePDF(filePathOrBuffer, mimeType),
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': (filePathOrBuffer, mimeType) => this.parseDOCX(filePathOrBuffer, mimeType)
+    };
+  }
 
-  // === MAIN PARSE FUNCTION ===
-  async parseResume(filePath, mimeType) {
-    try {
-      const parser = this.supportedFormats[mimeType];
-      if (!parser) throw new Error(`Unsupported file format: ${mimeType}`);
+  // === MAIN PARSE FUNCTION ===
+  async parseResume(filePathOrBuffer, mimeType) {
+    try {
+      const parser = this.supportedFormats[mimeType];
+      if (!parser) throw new Error(`Unsupported file format: ${mimeType}`);
 
-      // 1. Parse File to Text
-      const text = await parser(filePath);
-      
-      // 2. Extract Structured Data using AI
-      const extractedData = await this.extractStructuredData(text);
-      
-      // 3. Generate Embeddings (for retrieval/search)
-      const embedding = await this.generateEmbedding(text);
-      const skillsEmbedding = await this.generateSkillsEmbedding(extractedData.skills);
-      
-      // 4. Analyze Data using AI
-      const aiAnalysis = await this.analyzeResumeWithAI(extractedData);
+      // 1. Parse File to Text (supports both file path and buffer)
+      const text = await parser(filePathOrBuffer, mimeType);
+      
+      // 2. Extract Structured Data using AI
+      const extractedData = await this.extractStructuredData(text);
+      
+      // 3. Generate Embeddings (for retrieval/search)
+      const embedding = await this.generateEmbedding(text);
+      const skillsEmbedding = await this.generateSkillsEmbedding(extractedData.skills);
+      
+      // 4. Analyze Data using AI
+      const aiAnalysis = await this.analyzeResumeWithAI(extractedData);
 
-      return {
-        parsedText: text,
-        extractedData,
-        embedding,
-        skillsEmbedding,
-        aiAnalysis
-      };
-    } catch (error) {
-      console.error('Resume parsing error:', error);
-      throw new Error(`Failed to parse resume: ${error.message}`);
-    }
-  }
+      return {
+        parsedText: text,
+        extractedData,
+        embedding,
+        skillsEmbedding,
+        aiAnalysis
+      };
+    } catch (error) {
+      console.error('Resume parsing error:', error);
+      throw new Error(`Failed to parse resume: ${error.message}`);
+    }
+  }
 
-  // --- FILE PARSERS ---
-  async parsePDF(filePath) {
-    try {
-      const dataBuffer = fs.readFileSync(filePath);
-      const data = await pdfParse(dataBuffer);
-      return data.text;
-    } catch (error) {
-      throw new Error(`PDF parsing failed: ${error.message}`);
-    }
-  }
+  // --- FILE PARSERS ---
+  async parsePDF(filePathOrBuffer, mimeType) {
+    let tempFilePath = null;
+    try {
+      // Handle both file path (string) and buffer
+      let dataBuffer;
+      let shouldDeleteTempFile = false;
+      
+      if (Buffer.isBuffer(filePathOrBuffer)) {
+        // If it's already a buffer, create a fresh standalone Buffer
+        // This ensures we have a clean Buffer instance without any view issues
+        dataBuffer = Buffer.from(filePathOrBuffer);
+        
+        // Validate buffer is not empty
+        if (!dataBuffer || dataBuffer.length === 0) {
+          throw new Error('Empty file buffer');
+        }
+        
+        // Verify it's a valid PDF by checking the header (PDF files start with %PDF)
+        if (dataBuffer.length < 4 || dataBuffer.toString('ascii', 0, 4) !== '%PDF') {
+          throw new Error('Invalid PDF file: File does not appear to be a valid PDF');
+        }
+        
+        // Try to parse directly with the buffer first
+        // If that fails, fall back to temp file approach
+        try {
+          const data = await pdfParse(dataBuffer);
+          return data.text || '';
+        } catch (directParseError) {
+          // If direct buffer parsing fails, try using a temp file
+          console.warn('Direct buffer parsing failed, trying temp file approach:', directParseError.message);
+          
+          // Write buffer to temporary file
+          tempFilePath = path.join(os.tmpdir(), `resume-${Date.now()}-${Math.random().toString(36).substring(7)}.pdf`);
+          fs.writeFileSync(tempFilePath, dataBuffer);
+          shouldDeleteTempFile = true;
+          
+          // Read file and parse (this should work since it's a fresh file)
+          const fileBuffer = fs.readFileSync(tempFilePath);
+          const data = await pdfParse(fileBuffer);
+          
+          // Clean up temp file
+          if (shouldDeleteTempFile && tempFilePath && fs.existsSync(tempFilePath)) {
+            try {
+              fs.unlinkSync(tempFilePath);
+              tempFilePath = null;
+            } catch (unlinkError) {
+              console.error('Error deleting temp file:', unlinkError);
+            }
+          }
+          
+          return data.text || '';
+        }
+      } else if (typeof filePathOrBuffer === 'string') {
+        // If it's a file path, read it from disk and parse
+        const data = await pdfParse(fs.readFileSync(filePathOrBuffer));
+        return data.text || '';
+      } else {
+        throw new Error('Invalid input: expected file path (string) or buffer');
+      }
+    } catch (error) {
+      // Clean up temp file on error
+      if (tempFilePath && fs.existsSync(tempFilePath)) {
+        try {
+          fs.unlinkSync(tempFilePath);
+        } catch (unlinkError) {
+          console.error('Error deleting temp file on error:', unlinkError);
+        }
+      }
+      
+      console.error('PDF parsing error:', error);
+      console.error('Input type:', Buffer.isBuffer(filePathOrBuffer) ? 'Buffer' : typeof filePathOrBuffer);
+      if (Buffer.isBuffer(filePathOrBuffer)) {
+        console.error('Buffer length:', filePathOrBuffer.length);
+        console.error('Buffer first bytes:', filePathOrBuffer.slice(0, 10).toString('hex'));
+      }
+      throw new Error(`PDF parsing failed: ${error.message}`);
+    }
+  }
 
-  async parseDOCX(filePath) {
-    try {
-      const result = await mammoth.extractRawText({ path: filePath });
-      return result.value;
-    } catch (error) {
-      throw new Error(`DOCX parsing failed: ${error.message}`);
-    }
-  }
+  async parseDOCX(filePathOrBuffer, mimeType) {
+    try {
+      // Handle both file path (string) and buffer
+      if (Buffer.isBuffer(filePathOrBuffer)) {
+        // For buffer, we need to use extractRawText with buffer
+        const result = await mammoth.extractRawText({ buffer: filePathOrBuffer });
+        return result.value;
+      } else if (typeof filePathOrBuffer === 'string') {
+        // For file path, use path option
+        const result = await mammoth.extractRawText({ path: filePathOrBuffer });
+        return result.value;
+      } else {
+        throw new Error('Invalid input: expected file path (string) or buffer');
+      }
+    } catch (error) {
+      console.error('DOCX parsing error:', error);
+      throw new Error(`DOCX parsing failed: ${error.message}`);
+    }
+  }
 
   // === RULE-BASED FALLBACK EXTRACTION ===
   // [Keeping ruleBasedExtraction as is, as it's a fallback]
@@ -209,8 +295,8 @@ You are an expert resume parsing API. Your sole task is to analyze the provided 
 ${text}
       `;
 
-      // Use gemini-2.5-flash for better instruction following
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      // Use configured Gemini model for data extraction
+      const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
       const result = await model.generateContent(prompt);
       const response = await result.response;
       const extractedText = response.text();
@@ -273,31 +359,31 @@ ${text}
     };
   }
 
-  // --- EMBEDDING GENERATION ---
-  async generateEmbedding(text) {
-    try {
-      const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
-      // Truncate text to avoid model input limits if necessary
-      const result = await model.embedContent(text.substring(0, 8000));
-      return result.embedding.values;
-    } catch (error) {
-      console.error('Embedding generation error:', error);
-      return []; // prevent crash on quota limit
-    }
-  }
+  // --- EMBEDDING GENERATION ---
+  async generateEmbedding(text) {
+    try {
+      const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
+      // Truncate text to avoid model input limits if necessary
+      const result = await model.embedContent(text.substring(0, 8000));
+      return result.embedding.values;
+    } catch (error) {
+      console.error('Embedding generation error:', error);
+      return []; // prevent crash on quota limit
+    }
+  }
 
-  async generateSkillsEmbedding(skills) {
-    try {
-      if (!skills || skills.length === 0) return [];
-      const skillsText = skills.map(skill => skill.name).join(', ');
-      const model = genAI.getGenerativeModel({ model: 'text-embedding-004' });
-      const result = await model.embedContent(skillsText);
-      return result.embedding.values;
-    } catch (error) {
-      console.error('Skills embedding generation error:', error);
-      return [];
-    }
-  }
+  async generateSkillsEmbedding(skills) {
+    try {
+      if (!skills || skills.length === 0) return [];
+      const skillsText = skills.map(skill => skill.name || skill).join(', ');
+      const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
+      const result = await model.embedContent(skillsText);
+      return result.embedding.values;
+    } catch (error) {
+      console.error('Skills embedding generation error:', error);
+      return [];
+    }
+  }
 
   // --- AI RESUME ANALYSIS (with Guaranteed JSON Output) ---
   async analyzeResumeWithAI(resumeData) {
@@ -321,16 +407,32 @@ Provide the analysis in this JSON format:
 Provide the following analysis points, making sure the overallScore is a thoughtful reflection of the candidate's quality (0-100).
       `;
 
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const text = response.text();
+      const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
 
-      const fencedClean = text.replace(/```json|```/g, '').trim();
-      const jsonStart = fencedClean.indexOf('{');
-      const jsonEnd = fencedClean.lastIndexOf('}');
-      const cleanJson = fencedClean.substring(jsonStart, jsonEnd + 1);
-      return JSON.parse(cleanJson);
+      // Clean and parse JSON response
+      let fencedClean = text.replace(/```json|```/g, '').trim();
+      const jsonStart = fencedClean.indexOf('{');
+      const jsonEnd = fencedClean.lastIndexOf('}');
+      
+      if (jsonStart === -1 || jsonEnd === -1 || jsonEnd < jsonStart) {
+        throw new Error('No valid JSON found in AI response');
+      }
+      
+      const cleanJson = fencedClean.substring(jsonStart, jsonEnd + 1);
+      const parsed = JSON.parse(cleanJson);
+      
+      // Ensure all required fields exist with defaults
+      if (!parsed.strengths) parsed.strengths = [];
+      if (!parsed.weaknesses) parsed.weaknesses = [];
+      if (!parsed.improvementSuggestions) parsed.improvementSuggestions = [];
+      if (!parsed.skillGaps) parsed.skillGaps = [];
+      if (typeof parsed.overallScore !== 'number') parsed.overallScore = 70;
+      if (!parsed.lastAnalyzed) parsed.lastAnalyzed = new Date().toISOString();
+      
+      return parsed;
 
     } catch (error) {
       console.error('AI analysis error:', error);
